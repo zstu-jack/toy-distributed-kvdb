@@ -36,7 +36,7 @@ const (
 	Leader RaftState = iota
 	Candidate
 	Follower
-	ChanSize = 100
+	ChanSize = 2000
 )
 
 var StateString = map[RaftState]string{
@@ -160,6 +160,9 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
@@ -170,6 +173,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.log)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
+
 }
 
 //
@@ -181,6 +185,9 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	if d.Decode(&rf.currentTerm) != nil ||
@@ -489,25 +496,24 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					if requestAppendEntries.Request.Term > rf.currentTerm {
 						rf.ModifyTerm(requestAppendEntries.Request.Term)
 					}
+					requestAppendEntries.Reply.Term = rf.currentTerm
+
 					prevLogIndex := requestAppendEntries.Request.PrevLogIndex
 					prevLogTerm := requestAppendEntries.Request.PrevLogTerm
 					entries := requestAppendEntries.Request.Entries
-
 					// BUG: CHECK length for log & Leader'PrevLogIndex
 					if requestAppendEntries.Request.PrevLogIndex > rf.log[len(rf.log)-1].Index {
-						requestAppendEntries.Reply.NextIndex = rf.log[len(rf.log)-1].Index + 1
 						requestAppendEntries.DoneChan <- 1
 						break
 					}
 
 					offset := requestAppendEntries.Request.PrevLogIndex - rf.log[0].Index
-
 					// BUG!!!: case : check log term. decrease one each time...
-					if requestAppendEntries.Request.PrevLogIndex >= 0 {
-						term := rf.log[offset].Term
+					if requestAppendEntries.Request.PrevLogIndex > 0 {
+						term := rf.log[offset].Term // prevLog's Term.
 						if prevLogTerm != term {
 							for i := offset - 1; i >= 0; i-- {
-								if rf.log[i].Term != term { // term in log
+								if rf.log[i].Term != term {
 									requestAppendEntries.Reply.NextIndex = rf.log[i].Index + 1
 									break
 								}
@@ -544,23 +550,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						DPrintf("Log Apply ================= index=%v len(log)=%v, Log=%v", i, len(rf.log), rf.log[i].Log)
 						msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: rf.log[i].Index}
 						rf.applyChan <- msg
-						rf.lastApplied = i
+						rf.lastApplied = rf.log[i].Index
 					}
-					// BUG: not found, set next index for caller(leader)
 				}
 				requestAppendEntries.DoneChan <- 1
 				break
 			case requestRequestVote := <-raft.requestVoteChan:
-				// BUG: check log before we vote for the request node.
+
+				requestRequestVote.Reply.VoteGranted = 0
 				if requestRequestVote.Request.Term < raft.currentTerm {
-					requestRequestVote.Reply.VoteGranted = 0
 					requestRequestVote.Reply.Term = raft.currentTerm
 				} else {
-
 					if requestRequestVote.Request.Term > raft.currentTerm {
 						rf.ModifyTerm(requestRequestVote.Request.Term)
 					}
+					requestRequestVote.Reply.Term = raft.currentTerm
 
+					// BUG: check log before we vote for the request node.
 					newer := false
 					if requestRequestVote.Request.LastLogTerm == rf.log[len(rf.log)-1].Term {
 						newer = requestRequestVote.Request.LastLogIndex >= rf.log[len(rf.log)-1].Index
@@ -573,13 +579,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						rf.votedFor = requestRequestVote.Request.CandidateId
 						rf.raftState = Follower
 						rf.persist()
-					} else {
-						requestRequestVote.Reply.VoteGranted = 0
 					}
-					requestRequestVote.Reply.Term = raft.currentTerm
-
 				}
-
 				requestRequestVote.DoneChan <- 1
 				break
 			case requestGetState := <-raft.getStateChan:
@@ -612,8 +613,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				break
 			// --------------------------------------------  rpc reply ------------------------------------------------------------------
 			case reply := <-rf.appendEntriesReplyChan:
-				if reply.Success == 0 {
-				}
 				rf.ModifyTerm(reply.Term)
 				if rf.raftState == Leader {
 					if reply.Success == 0 {
@@ -631,19 +630,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						rf.matchIndex[reply.Who] = reply.NextIndex - 1
 
 						offsetApplied := rf.lastApplied - rf.log[0].Index
-						offsetCommitted := 0
+						offsetCommitted := rf.commitIndex - rf.log[0].Index
 
-						for i := len(rf.log) - 1; i >= 0; i-- {
+						for i := offsetCommitted + 1; i < len(rf.log); i++ {
 							nReplicated := 0
 							if rf.log[i].Term == rf.currentTerm {
 								for j := 0; j < len(rf.peers); j++ {
+									if j == rf.me {
+										continue
+									}
 									DPrintf("node(%v) matchIndex=%v, LogIndex=%v", j, rf.matchIndex[j], rf.log[i].Index)
 									if rf.matchIndex[j] >= rf.log[i].Index {
 										nReplicated++
 									}
 								}
 								DPrintf("--------------------------apply?-------------------------- who=%v nReplicated=%v index=%v term=%v lastApplied=%v committedIndex=%v", rf.me, nReplicated, rf.log[i].Index, rf.log[i].Term, rf.lastApplied, rf.log[i].Index)
-								if nReplicated >= (len(rf.peers)+1)/2 {
+								if nReplicated >= len(rf.peers)/2 {
 									offsetCommitted = i
 									break
 								}

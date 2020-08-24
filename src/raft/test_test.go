@@ -941,7 +941,7 @@ func TestUnreliableChurn2C(t *testing.T) {
 }
 
 func TestFucking(t *testing.T) {
-	for i := 0; i < 100; i++ {
-		TestFigure8Unreliable2C(t)
-	}
+	//for i := 0; i < 100; i++ {
+	//	TestFigure8Unreliable2C(t)
+	//}
 }
