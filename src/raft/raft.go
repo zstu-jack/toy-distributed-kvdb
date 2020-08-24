@@ -470,8 +470,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rand.Seed(time.Now().UnixNano())
 
-	ElectionTimeOut := int32(250)
-	HeartBeatTimeOut := 100
+	ElectionTimeOut := int32(500)
+	HeartBeatTimeOut := 120
 
 	go func(raft *Raft) {
 		// now election timeout: [500-1000ms]
@@ -507,9 +507,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						break
 					}
 
-					offset := requestAppendEntries.Request.PrevLogIndex - rf.log[0].Index
+					offset := prevLogIndex - rf.log[0].Index
 					// BUG!!!: case : check log term. decrease one each time...
-					if requestAppendEntries.Request.PrevLogIndex > 0 {
+					if prevLogIndex > 0 {
 						term := rf.log[offset].Term // prevLog's Term.
 						if prevLogTerm != term {
 							for i := offset - 1; i >= 0; i-- {
@@ -521,11 +521,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							requestAppendEntries.DoneChan <- 1
 							break
 						}
-					}
-
-					if prevLogIndex < 0 {
-						requestAppendEntries.DoneChan <- 1
-						break
 					}
 
 					requestAppendEntries.Reply.Success = 1
@@ -594,11 +589,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.IncrementTerm()
 					rf.raftState = Candidate
 					rf.recvVotes = 1 // vote for self.
+					rf.votedFor = rf.me
+					rf.persist()
 					rf.DoSendRequestVote()
 				}
-				timerElection = time.NewTimer(time.Duration(ElectionTimeOut+rand.Int31n(ElectionTimeOut)) * time.Millisecond)
+				timerElection.Reset(time.Duration(ElectionTimeOut+rand.Int31n(ElectionTimeOut)) * time.Millisecond)
 				recvdHeartBeat = 0
-				break
 			case <-timerHeartBeat.C:
 				// send heartbeat if current node is leader
 				if rf.raftState == Leader {
@@ -609,8 +605,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						rf.DoSendAppendEntries(i)
 					}
 				}
-				timerHeartBeat = time.NewTimer(time.Duration(HeartBeatTimeOut) * time.Millisecond)
-				break
+				timerHeartBeat.Reset(time.Duration(HeartBeatTimeOut) * time.Millisecond)
 			// --------------------------------------------  rpc reply ------------------------------------------------------------------
 			case reply := <-rf.appendEntriesReplyChan:
 				rf.ModifyTerm(reply.Term)
@@ -647,7 +642,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 								DPrintf("--------------------------apply?-------------------------- who=%v nReplicated=%v index=%v term=%v lastApplied=%v committedIndex=%v", rf.me, nReplicated, rf.log[i].Index, rf.log[i].Term, rf.lastApplied, rf.log[i].Index)
 								if nReplicated >= len(rf.peers)/2 {
 									offsetCommitted = i
-									break
 								}
 							}
 						}
@@ -660,7 +654,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						}
 					}
 				}
-				break
 			case reply := <-rf.RequestVoteReplyChan:
 				if reply.VoteGranted == 0 {
 					rf.ModifyTerm(reply.Term)
