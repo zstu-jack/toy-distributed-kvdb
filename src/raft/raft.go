@@ -371,25 +371,21 @@ func (rf *Raft) ModifyTerm(term int) {
 }
 
 func (rf *Raft) DoSendAppendEntries(To int) {
-	lastLogIndexForI := rf.nextIndex[To] - 1
-	theIndexInLeader := 0
-	for i := 0; i < len(rf.log); i++ {
-		if lastLogIndexForI == rf.log[i].Index {
-			theIndexInLeader = i
-			break
-		}
+	if rf.raftState != Leader {
+		panic("???????????? not a leader ?????????????")
+		return
+	}
+	offset := rf.nextIndex[To] - rf.log[0].Index
+	if offset > len(rf.log) {
+		offset = len(rf.log)
 	}
 
-	// FIXME ? once entries'size > 0. invalid memory address or nil pointer derefrence
-	//args := &AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex: rf.Log[lastLogIndexForI].(LogEntry).Index,
-	//	PrevLogTerm: rf.Log[lastLogIndexForI].(LogEntry).Term, Entries: rf.Log[theIndexInLeader+1:], LeaderCommitIndex: lastLogIndex}
 	rf.mu.Lock()
-	entries := make([]LogEntry, len(rf.log[theIndexInLeader+1:]))
-	copy(entries, rf.log[theIndexInLeader+1:])
-	args := &AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex: rf.log[lastLogIndexForI].Index,
-		PrevLogTerm: rf.log[lastLogIndexForI].Term, Entries: entries, LeaderCommitIndex: rf.commitIndex}
+	entries := make([]LogEntry, len(rf.log[offset:]))
+	copy(entries, rf.log[offset:])
+	args := &AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex: rf.log[offset-1].Index,
+		PrevLogTerm: rf.log[offset-1].Term, Entries: entries, LeaderCommitIndex: rf.commitIndex}
 	rf.mu.Unlock()
-
 	go func(i int, args *AppendEntriesArgs) {
 		rf.sendAppendEntries(i, args, nil)
 	}(To, args)
@@ -485,9 +481,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				recvdHeartBeat = 1
 
 				requestAppendEntries.Reply.Who = rf.me
+				requestAppendEntries.Reply.NextIndex = rf.log[len(rf.log)-1].Index + 1
+				requestAppendEntries.Reply.Success = 0
 				if requestAppendEntries.Request.Term < rf.currentTerm {
-					DPrintf("AppendError Caused By Term Mismatch")
-					requestAppendEntries.Reply.Success = 0
 					requestAppendEntries.Reply.Term = rf.currentTerm
 				} else {
 					if requestAppendEntries.Request.Term > rf.currentTerm {
@@ -496,36 +492,61 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					prevLogIndex := requestAppendEntries.Request.PrevLogIndex
 					prevLogTerm := requestAppendEntries.Request.PrevLogTerm
 					entries := requestAppendEntries.Request.Entries
-					requestAppendEntries.Reply.Success = 0
 
-					for i := len(rf.log) - 1; i >= 0; i-- {
-						if rf.log[i].Index == prevLogIndex && rf.log[i].Term == prevLogTerm {
-							requestAppendEntries.Reply.Success = 1
-							rf.log = rf.log[0 : i+1]
-							// rf.Log = append(rf.Log, entries)  // BUG: error here. append a alice as interface{} (single element)
-							rf.log = append(rf.log, entries...)
-							rf.persist()
+					// BUG: CHECK length for log & Leader'PrevLogIndex
+					if requestAppendEntries.Request.PrevLogIndex > rf.log[len(rf.log)-1].Index {
+						requestAppendEntries.Reply.NextIndex = rf.log[len(rf.log)-1].Index + 1
+						requestAppendEntries.DoneChan <- 1
+						break
+					}
 
-							if requestAppendEntries.Request.LeaderCommitIndex > rf.commitIndex {
-								if requestAppendEntries.Request.LeaderCommitIndex > rf.log[len(rf.log)-1].Index {
-									rf.commitIndex = rf.log[len(rf.log)-1].Index
-								} else {
-									rf.commitIndex = requestAppendEntries.Request.LeaderCommitIndex
+					offset := requestAppendEntries.Request.PrevLogIndex - rf.log[0].Index
+
+					// BUG!!!: case : check log term. decrease one each time...
+					if requestAppendEntries.Request.PrevLogIndex >= 0 {
+						term := rf.log[offset].Term
+						if prevLogTerm != term {
+							for i := offset - 1; i >= 0; i-- {
+								if rf.log[i].Term != term { // term in log
+									requestAppendEntries.Reply.NextIndex = rf.log[i].Index + 1
+									break
 								}
 							}
-							requestAppendEntries.Reply.NextIndex = rf.log[len(rf.log)-1].Index + 1
-
-							// TODO: replicate code. Index in the Log struct
-							offsetApplied := rf.lastApplied - rf.log[0].Index
-							offsetCommitted := rf.commitIndex - rf.log[0].Index
-							for i := offsetApplied + 1; i <= offsetCommitted; i++ {
-								DPrintf("Log Apply ================= index=%v len(log)=%v, Log=%v", i, len(rf.log), rf.log[i].Log)
-								msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: rf.log[i].Index}
-								rf.applyChan <- msg
-								rf.lastApplied = i
-							}
+							requestAppendEntries.DoneChan <- 1
+							break
 						}
 					}
+
+					if prevLogIndex < 0 {
+						requestAppendEntries.DoneChan <- 1
+						break
+					}
+
+					requestAppendEntries.Reply.Success = 1
+					rf.log = rf.log[:offset+1]
+					// rf.Log = append(rf.Log, entries)  // BUG: error here. append a alice as interface{} (single element)
+					rf.log = append(rf.log, entries...)
+					rf.persist()
+					requestAppendEntries.Reply.NextIndex = rf.log[len(rf.log)-1].Index + 1
+
+					if requestAppendEntries.Request.LeaderCommitIndex > rf.commitIndex {
+						if requestAppendEntries.Request.LeaderCommitIndex > rf.log[len(rf.log)-1].Index {
+							rf.commitIndex = rf.log[len(rf.log)-1].Index
+						} else {
+							rf.commitIndex = requestAppendEntries.Request.LeaderCommitIndex
+						}
+					}
+
+					// TODO: replicate code. Index in the Log struct
+					offsetApplied := rf.lastApplied - rf.log[0].Index
+					offsetCommitted := rf.commitIndex - rf.log[0].Index
+					for i := offsetApplied + 1; i <= offsetCommitted; i++ {
+						DPrintf("Log Apply ================= index=%v len(log)=%v, Log=%v", i, len(rf.log), rf.log[i].Log)
+						msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: rf.log[i].Index}
+						rf.applyChan <- msg
+						rf.lastApplied = i
+					}
+					// BUG: not found, set next index for caller(leader)
 				}
 				requestAppendEntries.DoneChan <- 1
 				break
@@ -596,7 +617,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.ModifyTerm(reply.Term)
 				if rf.raftState == Leader {
 					if reply.Success == 0 {
-						rf.nextIndex[reply.Who] = rf.nextIndex[reply.Who] - 1
+						rf.nextIndex[reply.Who] = reply.NextIndex
 						if rf.nextIndex[reply.Who] < rf.log[0].Index+1 {
 							// Nothing to send.
 							rf.nextIndex[reply.Who] = rf.log[0].Index + 1
