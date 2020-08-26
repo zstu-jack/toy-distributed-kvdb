@@ -360,7 +360,6 @@ func (rf *Raft) Kill() {
 
 func (rf *Raft) IncrementTerm() {
 	rf.currentTerm = rf.currentTerm + 1
-	rf.votedFor = -1
 	rf.recvVotes = 0
 	rf.persist()
 }
@@ -500,6 +499,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				if request.Term > rf.currentTerm {
 					rf.ModifyTerm(request.Term)
 				}
+				rf.raftState = Follower
 				reply.Term = rf.currentTerm
 
 				prevLogIndex := request.PrevLogIndex
@@ -629,6 +629,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				timerHeartBeat.Reset(time.Duration(HeartBeatTimeOut) * time.Millisecond)
 			// --------------------------------------------  rpc reply ------------------------------------------------------------------
 			case reply := <-rf.appendEntriesReplyChan:
+
+				if reply.Term > rf.currentTerm {
+					rf.ModifyTerm(reply.Term)
+					break
+				}
+
 				if rf.raftState != Leader {
 					break
 				}
@@ -638,10 +644,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				//if reply.ReqTerm != rf.currentTerm {
 				//	break
 				//}
-				if reply.Term > rf.currentTerm {
-					rf.ModifyTerm(reply.Term)
-					break
-				}
 
 				if reply.Success == 0 {
 					rf.nextIndex[reply.Who] = reply.NextIndex
@@ -682,6 +684,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 			case reply := <-rf.RequestVoteReplyChan:
 
+				if reply.Term > rf.currentTerm {
+					rf.ModifyTerm(reply.Term)
+					break
+				}
+
 				if rf.raftState != Candidate {
 					break
 				}
@@ -690,10 +697,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					break //BUG: only consider current term's reply
 				}
 
-				if reply.Term > rf.currentTerm {
-					rf.ModifyTerm(reply.Term)
-					break
-				}
 				if reply.VoteGranted == 0 {
 					break
 				}
@@ -758,6 +761,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Start / GetState /
 
 	// should SyncDealing RPC RequestVote/RequestAppendEntries .???? not needed, since rpc's inherently uncertain
+
+	// !!! votedFor modification time: in case of multiple leaders. !!!
 
 	return rf
 }
