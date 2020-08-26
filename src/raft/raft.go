@@ -132,8 +132,8 @@ type Raft struct {
 	applyChan chan ApplyMsg // notify client the msg have been committed
 
 	// used for simplify problem
-	clientCommandChan      chan ClientCommandChan
 	recvVotes              int
+	clientCommandChan      chan ClientCommandChan
 	appendEntriesChan      chan AppendEntriesChan
 	requestVoteChan        chan RequestVoteChan
 	getStateChan           chan GetStateChan
@@ -190,6 +190,7 @@ func (args *RequestVoteArgs) ToString() string {
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	ReqTerm     int
 	Term        int
 	VoteGranted int
 }
@@ -438,18 +439,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+	// BUG: no need to append empty log IF log is not empty
+	if len(rf.log) == 0 {
+		rf.log = append(rf.log, LogEntry{Term: 0, Index: 0})
+	}
+
 	// volatile state for leader
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 	for i := 0; i < len(peers); i++ {
-		rf.nextIndex[i] = 1
+		rf.nextIndex[i] = rf.log[len(rf.log)-1].Index
 		rf.matchIndex[i] = 0
 	}
 
 	rf.applyChan = applyCh
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	// self-used struct
 	rf.recvVotes = 0
@@ -458,13 +463,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.getStateChan = make(chan GetStateChan, ChanSize)
 	rf.appendEntriesReplyChan = make(chan *AppendEntriesReply, ChanSize)
 	rf.RequestVoteReplyChan = make(chan *RequestVoteReply, ChanSize)
-	rf.endChan = make(chan int, 1)
+	rf.endChan = make(chan int, ChanSize)
 	rf.clientCommandChan = make(chan ClientCommandChan, ChanSize)
-
-	// BUG: no need to append empty log IF log is not empty
-	if len(rf.log) == 0 {
-		rf.log = append(rf.log, LogEntry{Term: 0, Index: 0})
-	}
 
 	rand.Seed(time.Now().UnixNano())
 
@@ -514,18 +514,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				offset := prevLogIndex - rf.log[0].Index
 				// BUG: case : check log term. decrease one each time...
 				// FIND FIRST LOG that has same index & term with leader.
-				if prevLogIndex > 0 {
-					term := rf.log[offset].Term // prevLog's Term.
-					if prevLogTerm != term {
-						for i := offset - 1; i >= 0; i-- {
-							if rf.log[i].Term != term { // optimization: jump over a segment which has same term
-								reply.NextIndex = rf.log[i].Index + 1
-								break
-							}
+				term := rf.log[offset].Term // prevLog's Term.
+				if prevLogTerm != term {
+					for i := offset - 1; i >= 0; i-- {
+						if rf.log[i].Term != term { // optimization: jump over a segment which has same term
+							reply.NextIndex = rf.log[i].Index + 1
+							break
 						}
-						requestAppendEntries.DoneChan <- 1
-						break
 					}
+					requestAppendEntries.DoneChan <- 1
+					break
 				}
 
 				rf.log = rf.log[:offset+1]
@@ -559,11 +557,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				req := requestRequestVote.Request
 				rsp := requestRequestVote.Reply
 
+				rsp.ReqTerm = req.Term
 				// Check Term & state
 				rsp.VoteGranted = 0
 				if req.Term < raft.currentTerm {
 					rsp.Term = raft.currentTerm
 					requestRequestVote.DoneChan <- 1
+					break
+				}
+				// BUG????
+				if req.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != req.CandidateId {
+					rsp.Term = rf.currentTerm
 					break
 				}
 
@@ -581,11 +585,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					newer = req.LastLogTerm > rf.log[len(rf.log)-1].Term
 				}
 
-				if rf.votedFor == -1 && newer {
+				if (rf.votedFor == -1 || rf.votedFor == req.CandidateId) && newer { // ???
 					rsp.VoteGranted = 1
 					rf.votedFor = req.CandidateId
 					rf.raftState = Follower
 					rf.persist()
+					// BUG: reset timer.
+					timerElection.Stop()
+					timerElection.Reset(time.Duration(ElectionTimeOut+rand.Int31n(ElectionTimeOut)) * time.Millisecond)
 				}
 
 				requestRequestVote.DoneChan <- 1
@@ -626,10 +633,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					break
 				}
 
-				// BUG: only deal with same term request's reply.
-				if reply.ReqTerm != rf.currentTerm {
-					break
-				}
+				// BUG???: only deal with same term request's reply.
+				// denpending on success or not success
+				//if reply.ReqTerm != rf.currentTerm {
+				//	break
+				//}
 				if reply.Term > rf.currentTerm {
 					rf.ModifyTerm(reply.Term)
 					break
@@ -637,11 +645,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 				if reply.Success == 0 {
 					rf.nextIndex[reply.Who] = reply.NextIndex
-					if rf.nextIndex[reply.Who] < rf.log[0].Index+1 { // Nothing to send.
-						rf.nextIndex[reply.Who] = rf.log[0].Index + 1
-					} else {
-						rf.DoSendAppendEntries(reply.Who) // Send Again
-					}
+					rf.DoSendAppendEntries(reply.Who) // Send Again
 					break
 				}
 				// update next
@@ -653,7 +657,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 				for i := offsetCommitted + 1; i < len(rf.log); i++ {
 					nReplicated := 0
-					if rf.log[i].Term == rf.currentTerm {
+					if rf.log[i].Term == rf.currentTerm { // Leader Send Append-> Other Election -> Leader Term Changed -> Leader Recv Reply   (would not commit)
+						//if rf.log[i].Term == reply.ReqTerm {
 						for j := 0; j < len(rf.peers); j++ {
 							if j == rf.me {
 								continue
@@ -676,38 +681,45 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				}
 
 			case reply := <-rf.RequestVoteReplyChan:
-				if reply.VoteGranted == 0 {
+
+				if rf.raftState != Candidate {
+					break
+				}
+
+				if reply.ReqTerm != rf.currentTerm {
+					break //BUG: only consider current term's reply
+				}
+
+				if reply.Term > rf.currentTerm {
 					rf.ModifyTerm(reply.Term)
-				} else {
-					if reply.Term != rf.currentTerm { //BUG: only consider current term
-						break
-					}
-					if rf.raftState != Candidate {
-						break
-					}
-					rf.recvVotes = rf.recvVotes + 1
-					if rf.recvVotes >= (len(rf.peers)+1)/2 {
-						DPrintf("%v become leader at Term %v\n", rf.me, rf.currentTerm)
-						rf.raftState = Leader
-						rf.recvVotes = 0
-						//rf.votedFor = -1
-						rf.persist()
+					break
+				}
+				if reply.VoteGranted == 0 {
+					break
+				}
+				rf.recvVotes = rf.recvVotes + 1
+				if rf.recvVotes >= (len(rf.peers)+1)/2 {
+					DPrintf("%v become leader at Term %v\n", rf.me, rf.currentTerm)
+					rf.raftState = Leader
+					rf.recvVotes = 0
+					//rf.votedFor = -1
+					rf.persist()
 
-						rf.nextIndex = make([]int, len(rf.peers))
-						rf.matchIndex = make([]int, len(rf.peers))
-						for i := range rf.peers {
-							rf.nextIndex[i] = rf.log[len(rf.log)-1].Index + 1 // BUG: initialize the nextIndex/matchIndex once the node become leader.
-							rf.matchIndex[i] = 0
-						}
+					rf.nextIndex = make([]int, len(rf.peers))
+					rf.matchIndex = make([]int, len(rf.peers))
+					for i := range rf.peers {
+						rf.nextIndex[i] = rf.log[len(rf.log)-1].Index + 1 // BUG: initialize the nextIndex/matchIndex once the node become leader.
+						rf.matchIndex[i] = 0
+					}
 
-						for i := 0; i < len(rf.peers); i++ {
-							if i == rf.me {
-								continue
-							}
-							rf.DoSendAppendEntries(i)
+					for i := 0; i < len(rf.peers); i++ {
+						if i == rf.me {
+							continue
 						}
+						rf.DoSendAppendEntries(i)
 					}
 				}
+
 			// --------------------------------------------  client command ------------------------------------------------------------------
 			case clientCommand := <-rf.clientCommandChan:
 				if rf.raftState != Leader {
@@ -734,11 +746,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					// AppliedIndex: Send To Client
 				}
 			case <-rf.endChan:
-				goto END
+				//fmt.Println("    =================================================KILLED ================================================= ")
+				//DPrintf("================================================================================================== KILLED =================================================")
+				//goto END
 			}
 		}
-	END:
+		//END:
 	}(rf)
+
+	// tester call RPC --> Message Chan --> Kill() ---> tester Wait for rpc reply forever ???
+	// Start / GetState /
+
+	// should SyncDealing RPC RequestVote/RequestAppendEntries .???? not needed, since rpc's inherently uncertain
 
 	return rf
 }
