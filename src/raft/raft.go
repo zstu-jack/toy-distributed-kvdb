@@ -358,16 +358,11 @@ func (rf *Raft) Kill() {
 	rf.endChan <- 1
 }
 
-func (rf *Raft) IncrementTerm() {
-	rf.currentTerm = rf.currentTerm + 1
-	rf.recvVotes = 0
-	rf.persist()
-}
 func (rf *Raft) ModifyTerm(term int) {
 	if term > rf.currentTerm {
 		rf.currentTerm = term
 		rf.votedFor = -1
-		rf.recvVotes = 0
+		// rf.recvVotes = 0
 		rf.raftState = Follower
 		rf.persist()
 	}
@@ -400,6 +395,9 @@ func (rf *Raft) DoSendRequestVote() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
+		}
+		if rf.raftState != Candidate {
+			panic("not a candidate")
 		}
 		args := &RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me,
 			LastLogTerm: rf.log[len(rf.log)-1].Term, LastLogIndex: rf.log[len(rf.log)-1].Index}
@@ -539,16 +537,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					} else {
 						rf.commitIndex = request.LeaderCommitIndex
 					}
-				}
 
-				// TODO: replicate code.
-				offsetApplied := rf.lastApplied - rf.log[0].Index
-				offsetCommitted := rf.commitIndex - rf.log[0].Index
-				for i := offsetApplied + 1; i <= offsetCommitted; i++ {
-					DPrintf("================================== (%v) Log Apply : index=%v term=%v len(log)=%v, Log=%v", rf.me, rf.log[i].Index, rf.log[i].Term, len(rf.log), rf.log[i].Log)
-					msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: rf.log[i].Index}
-					rf.applyChan <- msg
-					rf.lastApplied = rf.log[i].Index
+					// TODO: replicate code.
+					offsetApplied := rf.lastApplied - rf.log[0].Index
+					offsetCommitted := rf.commitIndex - rf.log[0].Index
+					for i := offsetApplied + 1; i <= offsetCommitted; i++ {
+						DPrintf("================================== (%v) Log Apply : index=%v term=%v len(log)=%v, Log=%v", rf.me, rf.log[i].Index, rf.log[i].Term, len(rf.log), rf.log[i].Log)
+						msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Log, CommandIndex: rf.log[i].Index}
+						rf.applyChan <- msg
+						rf.lastApplied = rf.log[i].Index
+					}
 				}
 
 				requestAppendEntries.DoneChan <- 1
@@ -565,12 +563,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					requestRequestVote.DoneChan <- 1
 					break
 				}
-				// BUG????
-				if req.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != req.CandidateId {
-					rsp.Term = rf.currentTerm
-					break
-				}
-
 				if req.Term > raft.currentTerm {
 					rf.ModifyTerm(req.Term)
 				}
@@ -585,7 +577,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					newer = req.LastLogTerm > rf.log[len(rf.log)-1].Term
 				}
 
-				if (rf.votedFor == -1 || rf.votedFor == req.CandidateId) && newer { // ???
+				if (rf.votedFor == -1 || rf.votedFor == req.CandidateId) && newer {
 					rsp.VoteGranted = 1
 					rf.votedFor = req.CandidateId
 					rf.raftState = Follower
@@ -604,7 +596,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			// --------------------------------------------  timeout ------------------------------------------------------------------
 			case <-timerElection.C:
 				if heartBeat == 0 && rf.raftState != Leader {
-					rf.IncrementTerm()
+					rf.currentTerm = rf.currentTerm + 1
 					DPrintf("(%v) start election state=%v at Term=%v\n", rf.me, StateString[rf.raftState], rf.currentTerm)
 					rf.raftState = Candidate
 					rf.recvVotes = 1 // vote for self.
@@ -630,6 +622,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			// --------------------------------------------  rpc reply ------------------------------------------------------------------
 			case reply := <-rf.appendEntriesReplyChan:
 
+				if reply.ReqTerm != rf.currentTerm {
+					break
+				}
 				if reply.Term > rf.currentTerm {
 					rf.ModifyTerm(reply.Term)
 					break
@@ -658,7 +653,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				offsetCommitted := rf.commitIndex - rf.log[0].Index
 
 				for i := offsetCommitted + 1; i < len(rf.log); i++ {
-					nReplicated := 0
+					nReplicated := 1
 					if rf.log[i].Term == rf.currentTerm { // Leader Send Append-> Other Election -> Leader Term Changed -> Leader Recv Reply   (would not commit)
 						//if rf.log[i].Term == reply.ReqTerm {
 						for j := 0; j < len(rf.peers); j++ {
@@ -669,7 +664,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 								nReplicated++
 							}
 						}
-						if nReplicated >= len(rf.peers)/2 {
+						if nReplicated > len(rf.peers)/2 {
 							offsetCommitted = i
 						}
 					}
@@ -701,7 +696,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					break
 				}
 				rf.recvVotes = rf.recvVotes + 1
-				if rf.recvVotes >= (len(rf.peers)+1)/2 {
+				if rf.recvVotes > len(rf.peers)/2 {
 					DPrintf("%v become leader at Term %v\n", rf.me, rf.currentTerm)
 					rf.raftState = Leader
 					rf.recvVotes = 0
