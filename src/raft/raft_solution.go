@@ -20,6 +20,7 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -48,6 +49,10 @@ type ApplyMsg struct {
 	Command      interface{}
 	UseSnapshot  bool   // ignore for lab2; only used in lab3
 	Snapshot     []byte // ignore for lab2; only used in lab3
+}
+
+func (msg *ApplyMsg) ToString() string {
+	return fmt.Sprint("commandIndex=%v, valid=%v, command=%v", msg.CommandIndex)
 }
 
 type logEntries struct {
