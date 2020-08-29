@@ -52,6 +52,7 @@ type GetReply struct {
 	WrongLeader bool
 	Err         Err
 	Value       string
+	command     Op
 }
 
 func (args *GetReply) ToString() string {

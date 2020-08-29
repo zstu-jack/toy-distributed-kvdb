@@ -70,6 +70,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.WrongLeader = applyReply.WrongLeader
 		reply.Err = applyReply.Err
 		reply.Value = applyReply.Value
+		if applyReply.command.RequestId != args.RequestId || applyReply.command.ClientId != args.ClientId {
+			reply.Err = NeedNewReq
+			reply.WrongLeader = true
+		}
 		// access databases.
 	case <-time.After(time.Duration(WaitRspTimeOut) * time.Millisecond):
 		reply.WrongLeader = false
@@ -100,9 +104,13 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	select {
 	// Wait For Command Been Applied
 	case applyReply := <-ch:
-		// TODO: retry if not same term.
 		reply.Err = applyReply.Err
 		reply.WrongLeader = applyReply.WrongLeader
+		// retry if not same term(Not the expected commit).
+		if applyReply.command.RequestId != args.RequestId || applyReply.command.ClientId != args.ClientId {
+			reply.Err = NeedNewReq
+			reply.WrongLeader = true
+		}
 		return
 	case <-time.After(time.Duration(WaitRspTimeOut) * time.Millisecond):
 		DPrintf("Wait For Command Reply TimeOut")
@@ -175,7 +183,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				DPrintf("commandIndex=%v clientId=%v, requestId=%v", applyMsg.CommandIndex, applyMsg.Command.(Op).ClientId, applyMsg.Command.(Op).RequestId)
 
 				// DPrintf(applyMsg.ToString())
-				getReply := GetReply{WrongLeader: false, Err: OK, Value: ""}
+				getReply := GetReply{WrongLeader: false, Err: OK, Value: "", command: applyMsg.Command.(Op)}
 
 				// BUG: apply even if there exist no client.
 				cmd := applyMsg.Command.(Op)
@@ -214,8 +222,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				//})
 				interfaceCh, ok := kv.replyChan.Load(applyMsg.CommandIndex)
 				if ok {
-					// TODO: command append but not committed (leadership changed before committed)
-					// TODO: add more info. check command contents.
 					ch := interfaceCh.(chan GetReply)
 					ch <- getReply // notify channel
 				}
