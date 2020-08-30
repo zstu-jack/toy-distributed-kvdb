@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
+	"labgob"
 	"math/rand"
 	"sync"
 	"time"
@@ -52,7 +53,7 @@ type ApplyMsg struct {
 }
 
 func (msg *ApplyMsg) ToString() string {
-	return fmt.Sprint("commandIndex=%v, valid=%v, command=%v", msg.CommandIndex)
+	return fmt.Sprintf("commandIndex=%v", msg.CommandIndex)
 }
 
 type logEntries struct {
@@ -123,14 +124,27 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	//w := new(bytes.Buffer)
+	//e := gob.NewEncoder(w)
+	//e.Encode(rf.currentTerm)
+	//e.Encode(rf.voteFor)
+	//e.Encode(rf.log)
+	//
+	//data := w.Bytes()
+	data := rf.persistData()
+	rf.persister.SaveRaftState(data)
+}
+func (rf *Raft) persistData() []byte {
 	w := new(bytes.Buffer)
-	e := gob.NewEncoder(w)
+	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.voteFor)
+	//e.Encode(rf.commitIndex)
+	//e.Encode(rf.lastApplied)
 	e.Encode(rf.log)
-
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	return data
 }
 
 //
@@ -182,6 +196,18 @@ type RequestAppendEntriesReply struct {
 	Success   bool
 	NextIndex int // used to tell leader that follower's next empty log, or leader can decrease one each time.
 }
+type RequestSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+	Offset            int // for optimization
+	Done              int
+}
+type RequestSnapshotReply struct {
+	Term int
+}
 
 //
 // example RequestVote RPC handler.
@@ -190,11 +216,12 @@ type RequestAppendEntriesReply struct {
 // rpc request/response should check term to convert self to follower;
 // 						should check peer's log info to vote peer.
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
-	//fmt.Printf("[::RequestVote]\n")
 	// Your code here.
 	rf.mtx.Lock()
 	defer rf.mtx.Unlock()
 	defer rf.persist()
+
+	//fmt.Printf("[::RequestVote] reqterm=%v, reqIndex=%v   voteTerm=%v, voteIndex=%v\n", args.LastLogTerm, args.LastLogIndex, rf.log[len(rf.log)-1].Term, rf.log[len(rf.log)-1].LogIndex)
 
 	reply.VoteGranted = false
 
@@ -259,12 +286,13 @@ func (rf *Raft) RequestAppendEntries(args RequestAppendEntriesArgs, reply *Reque
 	}
 
 	// case 3: check log term. decrease one each time...
-	if args.PrevLogIndex > 0 {
-		term := rf.log[args.PrevLogIndex].Term
+	prevLogOffset := rf.offset(args.PrevLogIndex)
+	if prevLogOffset >= 0 {
+		term := rf.log[prevLogOffset].Term
 		if args.PrevLogTerm != term {
-			for i := args.PrevLogIndex - 1; i >= 0; i-- {
+			for i := prevLogOffset - 1; i >= 0; i-- {
 				if rf.log[i].Term != term {
-					reply.NextIndex = i + 1
+					reply.NextIndex = rf.log[i].LogIndex + 1
 					break
 				}
 			}
@@ -273,10 +301,10 @@ func (rf *Raft) RequestAppendEntries(args RequestAppendEntriesArgs, reply *Reque
 	}
 
 	// step4: success: copy the log.
-	if args.PrevLogIndex < 0 {
+	if prevLogOffset < 0 {
 
 	} else {
-		rf.log = rf.log[:args.PrevLogIndex+1]
+		rf.log = rf.log[:prevLogOffset+1]
 		rf.log = append(rf.log, args.Entries...)
 		reply.Success = true
 		reply.NextIndex = rf.log[len(rf.log)-1].LogIndex + 1
@@ -292,6 +320,44 @@ func (rf *Raft) RequestAppendEntries(args RequestAppendEntriesArgs, reply *Reque
 		rf.chanCommit <- 1
 	}
 	return
+}
+
+func (rf *Raft) RequestSnapshot(args *RequestSnapshotArgs, reply *RequestSnapshotReply) {
+	rf.mtx.Lock()
+	defer rf.mtx.Unlock()
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	if args.LastIncludedIndex > rf.log[0].LogIndex {
+		newBeginIndex := rf.offset(args.LastIncludedIndex)
+		DPrintf("[1: RequestSnapshot(id=%v)] applyIndex=%v, commitIndex=%v, log[0].Index=%v newBeginIndex=%v len()=%d term=%v\n", rf.me, rf.lastApplied, rf.commitIndex, rf.log[0].LogIndex, newBeginIndex, len(rf.log), rf.currentTerm)
+		if newBeginIndex < len(rf.log) {
+			rf.log = append(rf.log[newBeginIndex:])
+		} else {
+			rf.log = []logEntries{{args.LastIncludedIndex, args.LastIncludedTerm, nil}} // last Log
+		}
+		rf.persister.SaveStateAndSnapshot(rf.persistData(), args.Data)
+
+		rf.commitIndex = Max(rf.commitIndex, rf.log[0].LogIndex)
+		rf.lastApplied = Max(rf.lastApplied, rf.log[0].LogIndex)
+
+		DPrintf("[2: RequestSnapshot(id=%v), len(log)=%v] applyIndex=%v, commitIndex=%v, log[0].Index=%v term=%v\n", rf.me, len(rf.log), rf.lastApplied, rf.commitIndex, rf.log[0].LogIndex, rf.currentTerm)
+
+		appliedOffset := rf.offset(rf.lastApplied)
+		commitOffset := rf.offset(rf.commitIndex)
+		for i := appliedOffset + 1; i <= commitOffset; i++ {
+			msg := ApplyMsg{CommandIndex: rf.log[i].LogIndex, Command: rf.log[i].Log, CommandValid: true}
+			rf.lastApplied = rf.log[i].LogIndex
+
+			rf.chanApply <- msg
+
+		}
+	}
+	// reset timer
+	rf.persist()
+	rf.chanApply <- ApplyMsg{CommandIndex: -1, CommandValid: false, Command: "ReadSnapshot"}
 }
 
 //
@@ -313,7 +379,6 @@ func (rf *Raft) RequestAppendEntries(args RequestAppendEntriesArgs, reply *Reque
 //
 func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-
 	rf.mtx.Lock()
 	defer rf.mtx.Unlock()
 
@@ -345,7 +410,6 @@ func (rf *Raft) sendAppendEntries(server int, args RequestAppendEntriesArgs, rep
 	//fmt.Printf("[sendAppendEntries][who=%v][term=%v]\n", rf.me, args.Term)
 
 	ok := rf.peers[server].Call("Raft.RequestAppendEntries", args, reply)
-
 	rf.mtx.Lock()
 	defer rf.mtx.Unlock()
 
@@ -405,26 +469,29 @@ func (rf *Raft) broadcastAppendEntries() {
 
 	N := rf.commitIndex
 
-	last := rf.log[len(rf.log)-1].LogIndex
+	rf.commitIndex = Max(rf.commitIndex, rf.log[0].LogIndex)
+	commitOffset := rf.offset(rf.commitIndex)
+	last := rf.offset(rf.log[len(rf.log)-1].LogIndex)
 
 	// step1: iterate all commitLog
-	for i := rf.commitIndex + 1; i <= last; i++ {
+	for i := commitOffset + 1; i <= last; i++ {
 		num := 1
 		for j := range rf.peers {
-			if j != rf.me && rf.matchIndex[j] >= i && rf.log[i].Term == rf.currentTerm {
+			if j != rf.me && rf.matchIndex[j] >= rf.log[i].LogIndex && rf.log[i].Term == rf.currentTerm {
 				num++
 			}
 		}
+
 		// replicated in majority of node.
 		if 2*num > len(rf.peers) {
-			N = i
+			N = rf.log[i].LogIndex
 		}
 	}
 
 	// step2: we can apply these logs.
 	if N != rf.commitIndex {
 		rf.commitIndex = N
-		rf.chanCommit <- 1 /// majority of nodes have commited, then we can move applyIndex //
+		rf.chanCommit <- 1 /// majority of nodes have committed, then we can move applyIndex //
 	}
 
 	for i := range rf.peers {
@@ -435,9 +502,17 @@ func (rf *Raft) broadcastAppendEntries() {
 				args.Term = rf.currentTerm
 				args.LeaderId = rf.me
 				args.PrevLogIndex = rf.nextIndex[i] - 1
-				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-				args.Entries = make([]logEntries, len(rf.log[args.PrevLogIndex+1:]))
-				copy(args.Entries, rf.log[args.PrevLogIndex+1:])
+
+				prevLogOffset := rf.offset(args.PrevLogIndex)
+				if prevLogOffset < 0 {
+					// no such entry. leader have done snapshot before
+					go rf.sendSnapshot(i)
+					continue
+				}
+
+				args.PrevLogTerm = rf.log[prevLogOffset].Term
+				args.Entries = make([]logEntries, len(rf.log[prevLogOffset+1:]))
+				copy(args.Entries, rf.log[prevLogOffset+1:])
 				args.LeaderCommitIndex = rf.commitIndex
 				go func(i int, args RequestAppendEntriesArgs) {
 					var reply RequestAppendEntriesReply
@@ -571,10 +646,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case <-rf.chanCommit:
 				rf.mtx.Lock()
 				commitIndex := rf.commitIndex
-				for i := rf.lastApplied + 1; i <= commitIndex; i++ {
-					msg := ApplyMsg{CommandIndex: i, Command: rf.log[i].Log, CommandValid: true}
+
+				rf.commitIndex = Max(rf.commitIndex, rf.log[0].LogIndex)
+				rf.lastApplied = Max(rf.lastApplied, rf.log[0].LogIndex)
+
+				appliedOffset := rf.offset(rf.lastApplied)
+				commitOffset := rf.offset(commitIndex)
+
+				for i := appliedOffset + 1; i <= commitOffset; i++ {
+					msg := ApplyMsg{CommandIndex: rf.log[i].LogIndex, Command: rf.log[i].Log, CommandValid: true}
+					rf.lastApplied = rf.log[i].LogIndex
 					applyCh <- msg
-					rf.lastApplied = i
 				}
 				rf.mtx.Unlock()
 			}
@@ -582,4 +664,60 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}()
 
 	return rf
+}
+
+func (rf *Raft) offset(index int) int {
+	return index - rf.log[0].LogIndex
+}
+
+func (rf *Raft) TakeSnapshot(lastIndex int, snapshot []byte) {
+	rf.mtx.Lock()
+	defer rf.mtx.Unlock()
+	if lastIndex < rf.log[0].LogIndex {
+		return
+	}
+
+	DPrintf("[1: TakeSnapshot(id=%d)] applyIndex=%v, commitIndex=%v, log[0].Index=%v state=%v\n", rf.me, rf.lastApplied, rf.commitIndex, rf.log[0].LogIndex, rf.state)
+	lastIndexOffset := rf.offset(lastIndex)
+
+	rf.log = rf.log[lastIndexOffset:]
+	data := rf.persistData()
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
+	rf.commitIndex = Max(rf.commitIndex, rf.log[0].LogIndex)
+	rf.lastApplied = Max(rf.lastApplied, rf.log[0].LogIndex)
+	DPrintf("[2: TakeSnapshot(id=%d)] applyIndex=%v, commitIndex=%v, log[0].Index=%v state=%v\n", rf.me, rf.lastApplied, rf.commitIndex, rf.log[0].LogIndex, rf.state)
+
+	//for i := 0; i < len(rf.peers); i ++ {
+	//	if i == rf.me {
+	//		continue
+	//	}
+	//	rf.sendSnapshot(i)
+	//}
+}
+
+func (rf *Raft) sendSnapshot(nodeId int) {
+	rf.mtx.Lock()
+	if rf.state != STATE_LEADER {
+		rf.mtx.Unlock()
+		return
+	}
+	args := RequestSnapshotArgs{Term: rf.currentTerm, LeaderId: rf.me, LastIncludedIndex: rf.log[0].LogIndex,
+		LastIncludedTerm: rf.log[0].Term, Data: rf.persister.ReadSnapshot()}
+	rf.mtx.Unlock()
+
+	var reply RequestSnapshotReply
+	if rf.peers[nodeId].Call("Raft.RequestSnapshot", &args, &reply) {
+		rf.mtx.Lock()
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.state = STATE_FOLLOWER
+			rf.voteFor = -1
+			rf.persist()
+			// reset timer.
+		} else {
+			rf.nextIndex[nodeId] = Max(rf.nextIndex[nodeId], rf.log[0].LogIndex+1)
+			rf.matchIndex[nodeId] = Max(rf.matchIndex[nodeId], rf.log[0].LogIndex)
+		}
+		rf.mtx.Unlock()
+	}
 }

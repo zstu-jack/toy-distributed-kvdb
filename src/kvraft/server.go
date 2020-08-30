@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"log"
@@ -40,6 +41,7 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
 
 	// Your definitions here.
 	databases    map[string]string
@@ -62,7 +64,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	ch := make(chan GetReply, 100)
 	kv.replyChan.Store(index, ch)
 
-	DPrintf("Server <---- %v", args.ToString())
+	DPrintf("Server(%v) <---- %v", kv.me, args.ToString())
 
 	select {
 	// Waiting for Command Applied
@@ -99,7 +101,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	ch := make(chan GetReply, 100)
 	kv.replyChan.Store(index, ch)
 
-	DPrintf("Server index=%v <---- %v", index, args.ToString())
+	DPrintf("Server(id=%v) index=%v isLeader=%v <---- %v", kv.me, index, isLeader, args.ToString())
 
 	select {
 	// Wait For Command Been Applied
@@ -135,6 +137,31 @@ func (kv *KVServer) Kill() {
 	// Your code here, if desired.
 }
 
+func (kv *KVServer) snapshot(index int) {
+	if kv.maxraftstate == -1 || kv.maxraftstate > kv.persister.RaftStateSize() {
+		return
+	}
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.clientMaxSeq) // avoid multi-times apply
+	e.Encode(kv.databases)
+	snapshot := w.Bytes()
+	kv.rf.TakeSnapshot(index, snapshot) // do snapshot
+}
+
+func (kv *KVServer) readSnapshot() { // done snapshot. notify by raft.
+	snapshot := kv.persister.ReadSnapshot()
+	if snapshot == nil || len(snapshot) <= 0 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&kv.clientMaxSeq) != nil ||
+		d.Decode(&kv.databases) != nil {
+		log.Panic("?????")
+	}
+}
+
 //
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
@@ -165,22 +192,24 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 1000)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
 	kv.databases = make(map[string]string)
 	kv.clientMaxSeq = make(map[int32]int32)
 
+	kv.readSnapshot()
+
 	go func() {
 		for {
 			applyMsg := <-kv.applyCh
 			kv.mu.Lock()
 			if applyMsg.CommandValid {
-				DPrintf("commandIndex=%v clientId=%v, requestId=%v", applyMsg.CommandIndex, applyMsg.Command.(Op).ClientId, applyMsg.Command.(Op).RequestId)
 
 				// DPrintf(applyMsg.ToString())
 				getReply := GetReply{WrongLeader: false, Err: OK, Value: "", command: applyMsg.Command.(Op)}
@@ -188,6 +217,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				// BUG: apply even if there exist no client.
 				cmd := applyMsg.Command.(Op)
 				op := applyMsg.Command.(Op)
+				DPrintf("commandIndex=%v clientId=%v, requestId=%v Optype=%v", applyMsg.CommandIndex, applyMsg.Command.(Op).ClientId, applyMsg.Command.(Op).RequestId, op.OpType)
 				if op.OpType == "Get" {
 					value, ok := kv.databases[op.Key]
 					if ok {
@@ -226,6 +256,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 					ch <- getReply // notify channel
 				}
 				kv.replyChan.Delete(applyMsg.CommandIndex)
+				kv.snapshot(applyMsg.CommandIndex) // do snapshot
+			} else {
+				if cmd, ok := applyMsg.Command.(string); ok {
+					if cmd == "ReadSnapshot" { // done snapshot
+						kv.readSnapshot()
+					}
+				}
 			}
 			kv.mu.Unlock()
 		}
